@@ -3,13 +3,12 @@ import taichi.math as tm
 import random
 from taichi.algorithms import parallel_sort
 import sys
-from config import particlesNb, simdimx, simdimy
+from config import particlesNb, simdimx, simdimy, treshold, G, eps, MAX_STACK_SIZE
 from fields import particles_coords, particle_indexes, prefix_boundaries, particle_masses, morton_keys, nodes_array, bounding_boxes, next_box_idx, next_node_idx
 from fields import TreeNode, AABB
 
 scale = 2147483647 # 2**31 - 1
 
-MAX_STACK_SIZE = 1024
 stack_phase = ti.field(ti.i32, shape=MAX_STACK_SIZE)
 stack_start = ti.field(ti.i32, shape=MAX_STACK_SIZE)
 stack_end = ti.field(ti.i32, shape=MAX_STACK_SIZE)
@@ -88,6 +87,11 @@ def iterativeBuild(start, end, depth):
     stack_ptr[None] = 0
     result_ptr[None] = 0
 
+    next_node_idx[None] = 0
+    next_box_idx[None] = 0
+    parent_idx = 0
+    box_idx = 0
+
     push_task(0, start, end, depth, 0, 0.0, 0.0, 0.0, 0.0)
 
     while (stack_ptr[None] > 0):
@@ -105,8 +109,8 @@ def iterativeBuild(start, end, depth):
                 mass = particle_masses[particle_indexes[start]]
                 parent_idx = ti.atomic_add(next_node_idx[None], 1)
                 nodes_array[parent_idx] = TreeNode(
-                    firstChild=start, nextSibling=-1, 
-                    mass=mass, com=com, nodeSideLength=0
+                    firstChild=particle_indexes[start], nextSibling=-1,
+                    mass=mass, com=com, nodeSideLength=-1
                 )
                 result_stack[result_ptr[None]] = parent_idx
                 result_ptr[None] += 1
@@ -115,11 +119,11 @@ def iterativeBuild(start, end, depth):
                 childNb = 0
                 cluster_left = ti.Vector([0]*8)
                 cluster_right = ti.Vector([0]*8)
-                currentCoord = particles_coords[particle_indexes[start]]
-                minx = currentCoord.x
-                maxx = currentCoord.x
-                miny = currentCoord.y
-                maxy = currentCoord.y
+                initialCoords = particles_coords[particle_indexes[start]]
+                minx = initialCoords.x
+                maxx = initialCoords.x
+                miny = initialCoords.y
+                maxy = initialCoords.y
 
                 if not computePrefixBoundaries(depth, start, end):
                     mid = start + (end - start) // 2
@@ -177,8 +181,7 @@ def iterativeBuild(start, end, depth):
                 children[i] = result_stack[result_ptr[None]]
             
             # Process children in original order
-            i = childNb - 1
-            while i >= 0:
+            for i in range(childNb):
                 child_idx = children[i]
                 child_node = nodes_array[child_idx]
                 total_mass += child_node.mass
@@ -186,27 +189,74 @@ def iterativeBuild(start, end, depth):
                 if firstChild == -1:
                     firstChild = child_idx
                 else:
-                    nodes_array[child_idx].nextSibling = previousSibling
+                    nodes_array[previousSibling].nextSibling = child_idx
                 previousSibling = child_idx
-                i -= 1
             
+            if previousSibling != -1:
+                nodes_array[previousSibling].nextSibling = -1
+
             if total_mass > 0:
                 node_com /= total_mass
             
             nodeSideLength = ti.max(maxx - minx, maxy - miny)
+            nodeCenter = ti.Vector([(minx + maxx) / 2, (miny + maxy) / 2])
             parent_idx = ti.atomic_add(next_node_idx[None], 1)
             nodes_array[parent_idx] = TreeNode(
                 firstChild=firstChild, nextSibling=-1,
-                mass=total_mass, com=node_com, nodeSideLength=nodeSideLength
+                mass=total_mass, com=node_com, nodeSideLength=nodeSideLength, center=nodeCenter
             )
             
             # Create bounding box
             box_idx = ti.atomic_add(next_box_idx[None], 1)
-            bounding_boxes[box_idx] = AABB(sideLength=nodeSideLength,
-                center=ti.Vector([(minx + maxx)/2, (miny + maxy)/2]))
+            bounding_boxes[box_idx] = AABB(
+                sideLength=nodeSideLength,
+                topleft=ti.Vector([minx, miny])
+            )
             
             result_stack[result_ptr[None]] = parent_idx
             result_ptr[None] += 1
 
     master_node_index = result_stack[0] if result_ptr[None] > 0 else -1
     return (master_node_index, next_box_idx[None])
+
+@ti.func
+def nodeContainsParticle(node_idx, coords):
+    target_center = nodes_array[node_idx].center
+    sideLength = nodes_array[node_idx].nodeSideLength
+    result = (coords.x >= target_center.x - sideLength / 2 and coords.x <= target_center.x + sideLength / 2
+              and coords.y >= target_center.y - sideLength / 2 and coords.y <= target_center.y + sideLength / 2)
+    return result
+
+@ti.func
+def computeGravityForParticle(particleIdx, masterNodeIndex):
+    stack = ti.Vector([0] * MAX_STACK_SIZE)
+    stack_top = 0
+    particle_pos = particles_coords[particleIdx]
+
+    total_force = tm.vec2(0.0, 0.0)
+
+    stack[stack_top] = masterNodeIndex
+    stack_top += 1
+    while (stack_top > 0):
+        stack_top -= 1
+        node_idx = stack[stack_top]
+        target_com = nodes_array[node_idx].com
+        r = target_com - particle_pos
+        dist = r.norm()
+        if (nodes_array[node_idx].firstChild == -1):
+            continue
+
+        if nodes_array[node_idx].nodeSideLength == -1:
+            if nodes_array[node_idx].firstChild != particleIdx:
+                total_force += G * nodes_array[node_idx].mass * r / (dist**2 + eps**2)**1.5
+        else:
+            if (nodes_array[node_idx].nodeSideLength / (dist + eps) < treshold and not nodeContainsParticle(node_idx, particle_pos)):
+                total_force += G * nodes_array[node_idx].mass * r / (dist**2 + eps**2)**1.5
+            else:
+                child = nodes_array[node_idx].firstChild
+                while (child != -1):
+                    stack[stack_top] = child
+                    stack_top += 1
+                    child = nodes_array[child].nextSibling
+
+    return total_force

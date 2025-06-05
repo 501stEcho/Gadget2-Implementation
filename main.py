@@ -1,68 +1,121 @@
 import taichi as ti
 import taichi.math as tm
-import random
 from taichi.algorithms import parallel_sort
 import sys
-from config import particlesNb, simdimx, simdimy, fps, dt, resx, resy
-
 ti.init(arch=ti.cpu)
+from config import particlesNb, simdimx, simdimy, fps, defaultdt, resx, resy, margin, minMass, maxMass, radius, centerx, centery, G, distribCoef
 
-from fields import pixels, particles_coords, particle_indexes, particle_masses, morton_keys, bounding_boxes, nodes_array, next_box_idx, next_node_idx, TreeNode, AABB
+from fields import pixels, particles_coords, particle_indexes, particle_masses, particles_vel
+from fields import morton_keys, next_box_idx
+from fields import timesteps, newstepsbuf
+from fields import TreeNode, AABB
+from integration import applyGravity
+from sph import solveEquationOfState, computePressureForces
 
 print(sys.getrecursionlimit())
 
 from quadtree import iterativeBuild, computeKeys
 
-for i in range(particlesNb):
-    particles_coords[i] = [random.uniform(100.0, simdimx - 100.0), random.uniform(100.0, simdimy - 100.0)]
-    particle_masses[i] = random.uniform(10, 100.0)
+timesteps.fill(-1)
+newstepsbuf.fill(-1)
+
+@ti.func
+def randgen(min, max):
+    return min + ti.random(float) * (max - min)
+
+@ti.kernel
+def spawnParticles():
+    # midrad = radius / 2.0
+    # for i in range(particlesNb):
+    #     coef = ti.tanh(ti.randn() * distribCoef)
+    #     centerDist = ti.max(midrad + coef * midrad, 10.0)
+    #     angle = ti.random(float) * 2 * tm.pi
+    #     relativePos = tm.vec2(tm.cos(angle), tm.sin(angle)) * centerDist
+    #     particles_coords[i] = tm.vec2(relativePos.x + centerx, relativePos.y + centery)
+    #     particle_masses[i] = ti.random(float) * (maxMass - minMass) + minMass
+    #     tangent = tm.vec2(relativePos.y, -relativePos.x).normalized()
+    #     speed = tm.sqrt((G * particle_masses[i]) / centerDist) * 10
+    #     particles_vel[i] = tangent * speed
+    #     timesteps[3, i] = i
+    for i in range(particlesNb):
+        particles_coords[i] = [randgen(margin, simdimx - margin), randgen(margin, simdimy - margin)]
+        particle_masses[i] = randgen(minMass, maxMass)
+        timesteps[3, i] = i
+
+    # mid = int(particlesNb / 2)
+    # particles_coords[mid] = [simdimx / 2, simdimy / 2]
+    # particle_masses[mid] = 2000.0
+    # particles_vel[mid] = [0, 0]
 
 gui = ti.GUI("Gadget2", res=(resx, resy))
 
 boxNb = 0
 
 @ti.kernel
-def constructQuadtree(startingDepth: int):
+def constructQuadtree(startingDepth: int) -> int:
     masterNoneIndex, boundingBoxNb = iterativeBuild(0, particlesNb, startingDepth)
-
-@ti.kernel
-def paint(i: float):
-    oldindex = int(i - 1) if i - 1 >= 0 else particlesNb - 1
-    oldcoord = particles_coords[particle_indexes[oldindex]]
-    coord = particles_coords[particle_indexes[int(i)]]
-    pixels[int(oldcoord.x), int(oldcoord.y)] = 0
-    pixels[int(coord.x), int(coord.y)] = float(particlesNb - 1 - i) / float(particlesNb)
+    return masterNoneIndex
 
 depth=4
 
-computeKeys()
-parallel_sort(morton_keys, particle_indexes)
-constructQuadtree(depth)
-
-print(particles_coords)
-print(particle_indexes)
+rest_density = 0.0
 
 gui.fps_limit = fps
 
-boxNb = next_box_idx[None]
+pause = False
+firstIt = True
 
-print(f"box nb : {boxNb}")
+spawnParticles()
 
-i = 0.0
+deltaTime = defaultdt
+it = 0
 while gui.running:
     gui.clear(0x000000)
+
+    for e in gui.get_events(gui.PRESS, gui.RELEASE):
+        if e.type == gui.RELEASE and (e.key == 'p' or e.key == ti.GUI.SPACE):
+            pause = not pause
+        elif e.key == ti.GUI.LEFT:
+            if (e.type == gui.PRESS):
+                deltaTime = 0.25 / fps
+            else:
+                deltaTime = 1 / fps
+        elif e.key == ti.GUI.RIGHT:
+            if (e.type == gui.PRESS):
+                deltaTime = 4 / fps
+            else:
+                deltaTime = 1 / fps
+
+    if (not pause):
+        computeKeys()
+        parallel_sort(morton_keys, particle_indexes)
+        masterNodeIndex = constructQuadtree(depth)
+        boxNb = next_box_idx[None]
+        applyGravity(masterNodeIndex, it, deltaTime)
+        if firstIt:
+            rest_density = solveEquationOfState(masterNodeIndex, rest_density, False)
+        else:
+            solveEquationOfState(masterNodeIndex, rest_density, True)
+        computePressureForces(masterNodeIndex, rest_density)
     
-    for i in range(boxNb):
-        box = bounding_boxes[i]
-        diagonal = tm.vec2(box.sideLength / 2, box.sideLength / 2)
-        topleft = (box.center - diagonal) / ti.Vector([simdimx, simdimy])
-        bottomRight = (box.center + diagonal) / ti.Vector([simdimx, simdimy])
-        gui.rect(topleft, bottomRight, color=0xFFFFFF)
+    # for i in range(boxNb):
+    #     box = bounding_boxes[i]
+    #     topleft = box.topleft / ti.Vector([simdimx, simdimy])
+    #     bottomRight = topleft + ti.Vector([box.sideLength, box.sideLength]) / ti.Vector([simdimx, simdimy])
+    #     gui.rect(topleft, bottomRight, color=0xFFFFFF)
 
     for i in range(particlesNb):
-        pos = particles_coords[particle_indexes[i]] / ti.Vector([simdimx, simdimy])
-        gui.circle(pos, radius=2, color=0xFF0000)
+        pos = particles_coords[i] / ti.Vector([simdimx, simdimy])
+        gui.circle(pos, radius=2, color=0xFFFFFF)
+    # gui.set_image(pixels)
     
     gui.text(f"Depth: {depth}", (0.05, 0.95))
+    gui.text(f"dt: {deltaTime}", (0.05, 0.9))
     
     gui.show()
+    pixels.fill(0)
+
+    if (it == 7):
+        it = 0
+    else:
+        it += 1
