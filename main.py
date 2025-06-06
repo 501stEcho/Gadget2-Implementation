@@ -3,7 +3,7 @@ import taichi.math as tm
 from taichi.algorithms import parallel_sort
 import sys
 ti.init(arch=ti.cpu)
-from config import particlesNb, simdimx, simdimy, fps, defaultdt, resx, resy, margin, minMass, maxMass, radius, centerx, centery, G, distribCoef
+from config import particlesNb, simdimx, simdimy, fps, defaultdt, resx, resy, margin, minMass, maxMass, radius, centerx, centery, G, distribCoef, centralObjectMass
 
 from fields import pixels, particles_coords, particle_indexes, particle_masses, particles_vel
 from fields import morton_keys, next_box_idx
@@ -25,27 +25,30 @@ def randgen(min, max):
 
 @ti.kernel
 def spawnParticles():
-    # midrad = radius / 2.0
-    # for i in range(particlesNb):
-    #     coef = ti.tanh(ti.randn() * distribCoef)
-    #     centerDist = ti.max(midrad + coef * midrad, 10.0)
-    #     angle = ti.random(float) * 2 * tm.pi
-    #     relativePos = tm.vec2(tm.cos(angle), tm.sin(angle)) * centerDist
-    #     particles_coords[i] = tm.vec2(relativePos.x + centerx, relativePos.y + centery)
-    #     particle_masses[i] = ti.random(float) * (maxMass - minMass) + minMass
-    #     tangent = tm.vec2(relativePos.y, -relativePos.x).normalized()
-    #     speed = tm.sqrt((G * particle_masses[i]) / centerDist) * 10
-    #     particles_vel[i] = tangent * speed
-    #     timesteps[3, i] = i
-    for i in range(particlesNb):
-        particles_coords[i] = [randgen(margin, simdimx - margin), randgen(margin, simdimy - margin)]
-        particle_masses[i] = randgen(minMass, maxMass)
-        timesteps[3, i] = i
+    if (len(sys.argv) <= 1 or sys.argv[1] == "square"):
+        for i in range(particlesNb):
+            particles_coords[i] = [randgen(margin, simdimx - margin), randgen(margin, simdimy - margin)]
+            particle_masses[i] = randgen(minMass, maxMass)
+            timesteps[3, i] = i
+    elif (len(sys.argv) > 1 and sys.argv[1] == "circle"):
+        midrad = radius / 2.0
+        for i in range(particlesNb):
+            coef = ti.tanh(ti.randn() * distribCoef)
+            centerDist = ti.max(midrad + coef * midrad, 10.0)
+            angle = ti.random(float) * 2 * tm.pi
+            relativePos = tm.vec2(tm.cos(angle), tm.sin(angle)) * centerDist
+            particles_coords[i] = tm.vec2(relativePos.x + centerx, relativePos.y + centery)
+            particle_masses[i] = ti.random(float) * (maxMass - minMass) + minMass
+            tangent = tm.vec2(relativePos.y, -relativePos.x).normalized()
+            speed = tm.sqrt((G * particle_masses[i]) / centerDist) * 10
+            particles_vel[i] = tangent * speed
+            timesteps[3, i] = i
 
-    # mid = int(particlesNb / 2)
-    # particles_coords[mid] = [simdimx / 2, simdimy / 2]
-    # particle_masses[mid] = 2000.0
-    # particles_vel[mid] = [0, 0]
+    if (len(sys.argv) > 2 and sys.argv[2] == "--centralObject"):
+        mid = int(particlesNb / 2)
+        particles_coords[mid] = [simdimx / 2, simdimy / 2]
+        particle_masses[mid] = centralObjectMass
+        particles_vel[mid] = [0, 0]
 
 gui = ti.GUI("Gadget2", res=(resx, resy))
 
@@ -79,12 +82,12 @@ while gui.running:
             if (e.type == gui.PRESS):
                 deltaTime = 0.25 / fps
             else:
-                deltaTime = 1 / fps
+                deltaTime = defaultdt
         elif e.key == ti.GUI.RIGHT:
             if (e.type == gui.PRESS):
                 deltaTime = 4 / fps
             else:
-                deltaTime = 1 / fps
+                deltaTime = defaultdt
 
     if (not pause):
         computeKeys()
